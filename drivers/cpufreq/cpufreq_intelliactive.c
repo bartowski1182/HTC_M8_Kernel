@@ -109,7 +109,7 @@ static unsigned int *above_hispeed_delay = default_above_hispeed_delay;
 static int nabove_hispeed_delay = ARRAY_SIZE(default_above_hispeed_delay);
 
 /* Non-zero means indefinite speed boost active */
-static int boost_val;
+//static int boost_val;
 #define DEFAULT_BOOSTPULSE_DURATION 350000
 /* Duration of a boot pulse in usecs */
 static int boostpulse_duration_val = DEFAULT_BOOSTPULSE_DURATION;
@@ -126,7 +126,7 @@ static int timer_slack_val = DEFAULT_TIMER_SLACK;
 static bool io_is_busy = true;
 
 #define DEFAULT_INPUT_BOOST_FREQ 1574400
-int input_boost_freq = DEFAULT_INPUT_BOOST_FREQ;
+int boost_val = DEFAULT_INPUT_BOOST_FREQ;
 extern u64 last_input_time;
 
 #define CPU_SYNC_FREQ 960000
@@ -489,21 +489,24 @@ static void cpufreq_interactive_timer(unsigned long data)
 
 	if (boosted)
 	{
-		if (new_freq < input_boost_freq)
-			new_freq = input_boost_freq;
+		if (new_freq < boost_val)
+			new_freq = boost_val;
 	}
-
+/*
 	if (counter > 0) {
 		counter--;
 		if (counter == 0) {
 			phase = 0;
 		}
 	}
-
+*/
 	if (pcpu->target_freq >= hispeed_freq &&
 	    new_freq > pcpu->target_freq &&
 	    now - pcpu->hispeed_validate_time <
 	    freq_to_above_hispeed_delay(pcpu->target_freq)) {
+		trace_cpufreq_interactive_notyet(
+			data, cpu_load, pcpu->target_freq,
+			pcpu->policy->cur, new_freq);
 		goto rearm;
 	}
 
@@ -516,8 +519,8 @@ static void cpufreq_interactive_timer(unsigned long data)
 
 	new_freq = pcpu->freq_table[index].frequency;
 
-	if (new_freq == pcpu->policy->cur)
-		goto rearm;
+	//if (new_freq == pcpu->policy->cur)
+	//	goto rearm;
 
 
 	/*
@@ -531,6 +534,9 @@ static void cpufreq_interactive_timer(unsigned long data)
 
 	if (new_freq < pcpu->floor_freq) {
 		if (now - pcpu->floor_validate_time < mod_min_sample_time) {
+			trace_cpufreq_interactive_notyet(
+				data, cpu_load, pcpu->target_freq,
+				pcpu->policy->cur, new_freq);
 			goto rearm;
 		}
 	}
@@ -549,8 +555,14 @@ static void cpufreq_interactive_timer(unsigned long data)
 	}
 
 	if (pcpu->target_freq == new_freq) {
+		trace_cpufreq_interactive_already(
+			data, cpu_load, pcpu->target_freq,
+			pcpu->policy->cur, new_freq);
 		goto rearm_if_notmax;
 	}
+
+	trace_cpufreq_interactive_target(data, cpu_load, pcpu->target_freq,
+					 pcpu->policy->cur, new_freq);
 
 	pcpu->target_freq = new_freq;
 	spin_lock_irqsave(&speedchange_cpumask_lock, flags);
@@ -591,11 +603,11 @@ static void cpufreq_interactive_idle_start(void)
 	}
 
 	/* Cancel the timer if cpu is offline */
-	if (cpu_is_offline(cpu)) {
+	/*if (cpu_is_offline(cpu)) {
 		del_timer(&pcpu->cpu_timer);
 		del_timer(&pcpu->cpu_slack_timer);
 		goto exit;
-	}
+	}*/
 
 	pending = timer_pending(&pcpu->cpu_timer);
 
@@ -699,14 +711,16 @@ static int cpufreq_interactive_speedchange_task(void *data)
 				__cpufreq_driver_target(pcpu->policy,
 							max_freq,
 							CPUFREQ_RELATION_H);
-
+			trace_cpufreq_interactive_setspeed(cpu,
+						     pcpu->target_freq,
+						     pcpu->policy->cur);
 			up_read(&pcpu->enable_sem);
 		}
 	}
 
 	return 0;
 }
-
+/*
 static void cpufreq_interactive_boost(void)
 {
 	int i;
@@ -731,7 +745,7 @@ static void cpufreq_interactive_boost(void)
 		 * Set floor freq and (re)start timer for when last
 		 * validated.
 		 */
-
+/*
 		pcpu->floor_freq = hispeed_freq;
 		pcpu->floor_validate_time = ktime_to_us(ktime_get());
 	}
@@ -741,7 +755,7 @@ static void cpufreq_interactive_boost(void)
 	if (anyboost)
 		wake_up_process(speedchange_task);
 }
-
+*/
 static int cpufreq_interactive_notifier(
 	struct notifier_block *nb, unsigned long val, void *data)
 {
@@ -870,6 +884,39 @@ static struct global_attr two_phase_freq_attr =
 	__ATTR(two_phase_freq, S_IRUGO | S_IWUSR,
 		show_two_phase_freq, store_two_phase_freq);
 */
+
+static int thread_migration_notify(struct notifier_block *nb,
+				unsigned long target_cpu, void *arg)
+{
+	unsigned long flags;
+	unsigned int boost_freq = CPU_SYNC_FREQ;
+	struct cpufreq_interactive_cpuinfo *target, *source;
+	target = &per_cpu(cpuinfo, target_cpu);
+	source = &per_cpu(cpuinfo, (int)arg);
+	
+	if (source->policy->cur > target->policy->cur)
+	{
+		if (source->policy->cur < boost_freq)
+			boost_freq = source->policy->cur;
+
+		target->target_freq = boost_freq;
+		target->floor_freq = boost_freq;
+		target->floor_validate_time = ktime_to_us(ktime_get());
+
+		spin_lock_irqsave(&speedchange_cpumask_lock, flags);
+		cpumask_set_cpu(target_cpu, &speedchange_cpumask);
+		spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
+
+		wake_up_process(speedchange_task);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block thread_migration_nb = {
+	.notifier_call = thread_migration_notify,
+};
+
 static ssize_t show_target_loads(
 	struct kobject *kobj, struct attribute *attr, char *buf)
 {
@@ -1111,15 +1158,18 @@ static ssize_t store_boost(struct kobject *kobj, struct attribute *attr,
 
 	boost_val = val;
 
-	if (boost_val) {
+	/*if (boost_val) {
 		cpufreq_interactive_boost();
-	}
+	}*/
 
 	return count;
 }
 
-define_one_global_rw(boost);
+//define_one_global_rw(boost);
 
+static struct global_attr boost_val_attr = __ATTR(boost_val, 0644,
+								show_boost, store_boost);
+/*
 static ssize_t store_boostpulse(struct kobject *kobj, struct attribute *attr,
 				const char *buf, size_t count)
 {
@@ -1130,14 +1180,17 @@ static ssize_t store_boostpulse(struct kobject *kobj, struct attribute *attr,
 	if (ret < 0)
 		return ret;
 
-	boostpulse_endtime = ktime_to_us(ktime_get()) + boostpulse_duration_val;
-	cpufreq_interactive_boost();
+	//boostpulse_endtime = ktime_to_us(ktime_get()) + boostpulse_duration_val;
+	//cpufreq_interactive_boost();
+	boostpulse_duration_val = val;	
 	return count;
 }
 
+define_one_global_rw(boostpulse_duration);
+
 static struct global_attr boostpulse =
 	__ATTR(boostpulse, 0200, NULL, store_boostpulse);
-
+*/
 static ssize_t show_boostpulse_duration(
 	struct kobject *kobj, struct attribute *attr, char *buf)
 {
@@ -1261,8 +1314,8 @@ static struct attribute *interactive_attributes[] = {
 	&min_sample_time_attr.attr,
 	&timer_rate_attr.attr,
 	&timer_slack.attr,
-	&boost.attr,
-	&boostpulse.attr,
+	&boost_val_attr.attr,
+	//&boostpulse.attr,
 	&boostpulse_duration.attr,
 	&io_is_busy_attr.attr,
 	&sampling_down_factor_attr.attr,
@@ -1272,7 +1325,7 @@ static struct attribute *interactive_attributes[] = {
 	//&two_phase_freq_attr.attr,
 	NULL,
 };
-
+/*
 static void interactive_input_event(struct input_handle *handle,
 		unsigned int type,
 		unsigned int code, int value)
@@ -1283,7 +1336,8 @@ static void interactive_input_event(struct input_handle *handle,
 		cpufreq_interactive_boost();
 	}
 }
-
+*/
+/*
 static int interactive_input_connect(struct input_handler *handler,
 		struct input_dev *dev, const struct input_device_id *id)
 {
@@ -1313,14 +1367,16 @@ err2:
 	kfree(handle);
 	return error;
 }
-
+*/
+/*
 static void interactive_input_disconnect(struct input_handle *handle)
 {
 	input_close_device(handle);
 	input_unregister_handle(handle);
 	kfree(handle);
 }
-
+*/
+/*
 static const struct input_device_id interactive_ids[] = {
 	{
 		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
@@ -1329,16 +1385,16 @@ static const struct input_device_id interactive_ids[] = {
 		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] =
 			    BIT_MASK(ABS_MT_POSITION_X) |
 			    BIT_MASK(ABS_MT_POSITION_Y) },
-	}, /* multi-touch touchscreen */
+	}, /* multi-touch touchscreen *//*
 	{
 		.flags = INPUT_DEVICE_ID_MATCH_KEYBIT |
 			 INPUT_DEVICE_ID_MATCH_ABSBIT,
 		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
 		.absbit = { [BIT_WORD(ABS_X)] =
 			    BIT_MASK(ABS_X) | BIT_MASK(ABS_Y) },
-	}, /* touchpad */
-};
-
+	}, /* touchpad *//*
+};*/
+/*
 static struct input_handler interactive_input_handler = {
 	.event		= interactive_input_event,
 	.connect	= interactive_input_connect,
@@ -1346,7 +1402,7 @@ static struct input_handler interactive_input_handler = {
 	.name		= "intelliactive",
 	.id_table	= interactive_ids,
 };
-
+*/
 static struct attribute_group interactive_attr_group = {
 	.attrs = interactive_attributes,
 	.name = "intelliactive",
@@ -1430,6 +1486,9 @@ static int cpufreq_governor_intelliactive(struct cpufreq_policy *policy,
 			return rc;
 		}
 
+		atomic_notifier_chain_register(&migration_notifier_head,
+					&thread_migration_nb);
+
 		idle_notifier_register(&cpufreq_interactive_idle_nb);
 		cpufreq_register_notifier(
 			&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
@@ -1449,11 +1508,15 @@ static int cpufreq_governor_intelliactive(struct cpufreq_policy *policy,
 		}
 
 		if (--active_count > 0) {
-			if (!policy->cpu)
-				input_unregister_handler(&interactive_input_handler);
+			/*if (!policy->cpu)
+				input_unregister_handler(&interactive_input_handler);*/
 			mutex_unlock(&gov_lock);
 			return 0;
 		}
+
+		atomic_notifier_chain_unregister(
+				&migration_notifier_head,
+				&thread_migration_nb);
 
 		cpufreq_unregister_notifier(
 			&cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER);
